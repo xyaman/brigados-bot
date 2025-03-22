@@ -5,19 +5,24 @@ import (
 	"fmt"
 	"log"
 	"os/exec"
+	"sync"
+	"syscall"
 
 	"strings"
 
 	"github.com/diamondburned/arikawa/v3/discord"
 	"github.com/diamondburned/arikawa/v3/gateway"
-	"github.com/diamondburned/arikawa/v3/session"
+	"github.com/diamondburned/arikawa/v3/state"
 	"github.com/diamondburned/arikawa/v3/voice"
-	"github.com/diamondburned/oggreader"
 )
+
+var ActivePlayers = make(map[discord.GuildID]*Player)
+var playersMutex = sync.Mutex{}
 
 type Player struct {
 	voiceSession *voice.Session
 	channel      chan Track
+	stopCh       chan struct{}
 }
 
 type Track struct {
@@ -37,6 +42,7 @@ func (p *Player) mainLoop() {
 
 		cmd := fmt.Sprintf("yt-dlp --quiet --ignore-errors --flat-playlist -o - '%s' | ffmpeg -i pipe:0 -f opus pipe:1", track.url)
 		ytdlp := exec.Command("bash", "-c", cmd)
+		ytdlp.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 
 		stdout, err := ytdlp.StdoutPipe()
 		if err != nil {
@@ -50,8 +56,14 @@ func (p *Player) mainLoop() {
 			return
 		}
 
-		if err := oggreader.DecodeBuffered(p.voiceSession, stdout); err != nil {
-			_ = fmt.Errorf("failed to decode ogg: %w", err)
+		if err := DecodeBuffered(p.voiceSession, stdout, p.stopCh); err != nil {
+			// _ = fmt.Errorf("failed to decode ogg: %w", err)
+
+			// kill main process (bash)
+			ytdlp.Process.Kill()
+
+			// kill spawned children (ytdlp & bash)
+			syscall.Kill(-ytdlp.Process.Pid, syscall.SIGKILL)
 			return
 		}
 		ytdlp.Wait()
@@ -59,44 +71,58 @@ func (p *Player) mainLoop() {
 }
 
 func main() {
-	// guildid := "795683075212312636"
-	var channelid discord.ChannelID = 1350659882730258565
 	token := ""
 
-	player := &Player{
-		channel: make(chan Track),
-	}
-
-	s := session.New("Bot " + token)
+	s := state.New("Bot " + token)
 	s.AddHandler(func(c *gateway.ReadyEvent) {
-		fmt.Printf("%s is ready.\n", c.User.Username)
-
-		v, err := voice.NewSession(s)
-		if err != nil {
-			log.Fatalln("Can't create voice session")
-		}
-
-		err = v.JoinChannelAndSpeak(context.TODO(), channelid, false, true)
-		if err != nil {
-			fmt.Println("Can't join create voice channel")
-			return
-		}
-
-		player.voiceSession = v
-
-		go player.mainLoop()
+		log.Printf("%s is ready.\n", c.User.Username)
 	})
 
 	s.AddHandler(func(c *gateway.MessageCreateEvent) {
-		// si el mensaje comeinza con !play url [1]
-		message := strings.TrimSpace(c.Content)
-		fmt.Println("Mensaje: ", message)
+		msg := strings.TrimSpace(c.Content)
 
-		if !strings.HasPrefix(message, "!play ") {
-			return
+		if msg == "!stop" {
+			player, ok := ActivePlayers[c.GuildID]
+			if ok {
+				// TODO: send exit signal to cancel current process ffmpeg etc
+				player.voiceSession.Leave(context.TODO())
+				close(player.stopCh)
+				delete(ActivePlayers, c.GuildID)
+			} else {
+				s.SendMessageReply(c.ChannelID, "I'm not in any channel", c.ID)
+			}
+
 		}
 
-		args := strings.Split(message, " ")
+		if !strings.HasPrefix(msg, "!play ") {
+			return
+		}
+		_, ok := ActivePlayers[c.GuildID]
+		if !ok {
+			vs, err := s.VoiceState(c.GuildID, c.Member.User.ID)
+			if err != nil {
+				s.SendMessageReply(c.ChannelID, "You need to be in a voice channel", c.ID)
+				return
+			}
+
+			v, err := voice.NewSession(s)
+			err = v.JoinChannelAndSpeak(context.TODO(), vs.ChannelID, false, true)
+			if err != nil {
+				fmt.Println("Can't join create voice channel")
+				return
+			}
+
+			player := &Player{
+				channel:      make(chan Track),
+				voiceSession: v,
+				stopCh:       make(chan struct{}),
+			}
+
+			ActivePlayers[c.GuildID] = player
+			go ActivePlayers[c.GuildID].mainLoop()
+		}
+
+		args := strings.Split(msg, " ")
 		url := args[1]
 
 		track := Track{
@@ -105,16 +131,14 @@ func main() {
 			requester: c.Author.Username,
 		}
 
-		// Invoke audio player
-		player.appendTrack(track)
+		ActivePlayers[c.GuildID].appendTrack(track)
 	})
 
 	voice.AddIntents(s)
 	s.AddIntents(gateway.IntentDirectMessages)
 	s.AddIntents(gateway.IntentGuildMessages)
+	s.AddIntents(gateway.IntentGuildVoiceStates)
 
-	// connect to discord
-	// TODO: see connect method
 	if err := s.Connect(context.Background()); err != nil {
 		log.Fatal("Can't connect to discord:", err)
 	}
