@@ -21,6 +21,7 @@ var playersMutex = sync.Mutex{}
 
 type Player struct {
 	voiceSession *voice.Session
+	isPlaying    bool
 	channel      chan Track
 	stopCh       chan struct{}
 }
@@ -39,6 +40,7 @@ func (p *Player) appendTrack(track Track) {
 func (p *Player) mainLoop() {
 	for {
 		track := <-p.channel
+		p.isPlaying = true
 
 		cmd := fmt.Sprintf("yt-dlp --quiet --ignore-errors --flat-playlist -o - '%s' | ffmpeg -i pipe:0 -f opus pipe:1", track.url)
 		ytdlp := exec.Command("bash", "-c", cmd)
@@ -55,7 +57,7 @@ func (p *Player) mainLoop() {
 			fmt.Println("Cant open ytdl, Error:", err)
 			return
 		}
-
+ 
 		if err := DecodeBuffered(p.voiceSession, stdout, p.stopCh); err != nil {
 			// _ = fmt.Errorf("failed to decode ogg: %w", err)
 
@@ -64,9 +66,12 @@ func (p *Player) mainLoop() {
 
 			// kill spawned children (ytdlp & bash)
 			syscall.Kill(-ytdlp.Process.Pid, syscall.SIGKILL)
+			p.isPlaying = false;
 			return
 		}
+
 		ytdlp.Wait()
+		p.isPlaying = false;
 	}
 }
 
@@ -92,6 +97,16 @@ func main() {
 				s.SendMessageReply(c.ChannelID, "I'm not in any channel", c.ID)
 			}
 
+			return
+		}
+
+		if msg == "!skip" {
+			player, ok := ActivePlayers[c.GuildID]
+			if ok && player.isPlaying {
+				player.stopCh <- struct{}{}
+			} else {
+				s.SendMessageReply(c.ChannelID, "I'm not in any channel", c.ID)
+			}
 		}
 
 		if !strings.HasPrefix(msg, "!play ") {
