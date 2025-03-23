@@ -143,3 +143,6 @@ func main() {
 		log.Fatal("Can't connect to discord:", err)
 	}
 }
+
+func fetchTrackMetadata() {
+}
