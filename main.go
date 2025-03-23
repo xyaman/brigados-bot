@@ -53,6 +53,7 @@ func (p *Player) mainLoop() {
 		}
 
 		err = ytdlp.Start()
+		log.Println("Starting new ytdl process. Url:", track.url)
 		if err != nil {
 			fmt.Println("Cant open ytdl, Error:", err)
 			return
@@ -67,7 +68,7 @@ func (p *Player) mainLoop() {
 			// kill spawned children (ytdlp & bash)
 			syscall.Kill(-ytdlp.Process.Pid, syscall.SIGKILL)
 			p.isPlaying = false;
-			return
+			continue
 		}
 
 		ytdlp.Wait()
@@ -107,6 +108,8 @@ func main() {
 			} else {
 				s.SendMessageReply(c.ChannelID, "I'm not in any channel", c.ID)
 			}
+
+			return
 		}
 
 		if !strings.HasPrefix(msg, "!play ") {
